@@ -2,6 +2,7 @@ import { parse } from './parser';
 import type {
   Program, ClassDecl, Statement, Expr,
   MemoryState, StackFrame, HeapObject, Variable, VarValue, Reference, SimulationStep,
+  IdentifierExpr, FieldAccessExpr, ArrayAccessExpr,
 } from './types';
 
 // Internal value type used during expression evaluation (may include raw strings before boxing)
@@ -23,6 +24,7 @@ export class Interpreter {
   private heap = new Map<string, HeapObject>();
   private callStack: StackFrame[] = [];
   private output: string[] = [];
+  private pendingLine = '';
   private steps: SimulationStep[] = [];
   private stringCounter = 0;
   private objectCounter = 0;
@@ -56,6 +58,7 @@ export class Interpreter {
       heap: Array.from(this.heap.values()).map(o => ({
         ...o,
         fields: o.fields.map(f => ({ ...f })),
+        elements: o.elements ? [...o.elements] : undefined,
       })),
       output: [...this.output],
     };
@@ -102,6 +105,8 @@ export class Interpreter {
 
   private declareVar(name: string, type: string, value: VarValue): string {
     const frame = this.currentFrame();
+    const existing = frame.variables.find(v => v.name === name);
+    if (existing) { existing.value = value; return `${frame.id}:${name}`; }
     frame.variables.push({ name, type, value });
     return `${frame.id}:${name}`;
   }
@@ -170,6 +175,10 @@ export class Interpreter {
       if (val.heapId === null) return 'null';
       const obj = this.heap.get(val.heapId);
       if (obj?.isString) return obj.stringValue ?? '';
+      if (obj?.isArray && obj.elements) {
+        const parts = obj.elements.map(e => this.toJavaString(this.toEvalValue(e)));
+        return `[${parts.join(', ')}]`;
+      }
       if (obj) return `${obj.className}@${obj.id}`;
       return 'null';
     }
@@ -211,13 +220,14 @@ export class Interpreter {
           if (expr.field === 'E') return Math.E;
           throw new Error(`Line ${expr.line}: Math.${expr.field} is not supported`);
         }
-        // Handle System.out.println chain: FieldAccess on FieldAccess
         const objVal = this.evalExpr(expr.object);
         if (!isRef(objVal) || objVal.heapId === null) {
           throw new Error(`Line ${expr.line}: field access on non-object`);
         }
         const obj = this.heap.get(objVal.heapId);
         if (!obj) throw new Error(`Line ${expr.line}: heap object not found`);
+        // .length on arrays and ArrayLists
+        if (expr.field === 'length' && obj.isArray) return obj.elements?.length ?? 0;
         const field = obj.fields.find(f => f.name === expr.field);
         if (!field) return NULL_REF;
         return this.toEvalValue(field.value);
@@ -254,7 +264,65 @@ export class Interpreter {
         const val = this.evalExpr(expr.operand);
         if (expr.op === '-' && typeof val === 'number') return -val;
         if (expr.op === '!') return !val;
+        if ((expr.op === '++' || expr.op === '--') && typeof val === 'number') {
+          const newVal = expr.op === '++' ? val + 1 : val - 1;
+          if (expr.operand.kind === 'IdentifierExpr') {
+            const name = (expr.operand as IdentifierExpr).name;
+            if (!this.setVar(name, newVal)) {
+              const thisRef = this.currentThis;
+              if (thisRef?.heapId) {
+                const obj = this.heap.get(thisRef.heapId);
+                const field = obj?.fields.find(f => f.name === name);
+                if (field) field.value = newVal;
+              }
+            }
+          } else if (expr.operand.kind === 'ArrayAccessExpr') {
+            const aa = expr.operand as ArrayAccessExpr;
+            const arrRef = this.evalExpr(aa.array);
+            const idx = this.evalExpr(aa.index) as number;
+            if (isRef(arrRef) && arrRef.heapId) {
+              const arrObj = this.heap.get(arrRef.heapId);
+              if (arrObj?.isArray && arrObj.elements) arrObj.elements[idx] = newVal;
+            }
+          }
+          return val; // post-increment: return original value
+        }
         return val;
+      }
+
+      case 'ArrayAccessExpr': {
+        const arrRef = this.evalExpr(expr.array);
+        if (!isRef(arrRef) || arrRef.heapId === null) throw new Error(`Line ${expr.line}: array access on non-array`);
+        const arrObj = this.heap.get(arrRef.heapId);
+        if (!arrObj?.isArray || !arrObj.elements) throw new Error(`Line ${expr.line}: not an array`);
+        const idx = this.evalExpr(expr.index) as number;
+        if (idx < 0 || idx >= arrObj.elements.length) throw new Error(`Line ${expr.line}: array index ${idx} out of bounds (length ${arrObj.elements.length})`);
+        return this.toEvalValue(arrObj.elements[idx]);
+      }
+
+      case 'NewArrayExpr': {
+        const dims = expr.dimensions.map(d => this.evalExpr(d) as number);
+        if (dims.length === 1) return this.evalNewArray(expr.elementType, dims[0], expr.line);
+        return this.evalNewArrayND(expr.elementType, dims, expr.line);
+      }
+
+      case 'ArrayInitExpr': {
+        const elements = expr.elements.map(e => {
+          const v = this.evalExpr(e);
+          if (typeof v === 'string') {
+            const ref = this.boxString(v);
+            this.addStep(e.line, `Allocate String "${v}" on heap`, { newHeapIds: [ref.heapId!] });
+            return ref;
+          }
+          return v as VarValue;
+        });
+        const id = this.newObjectId();
+        const elementType = this.inferElementType(elements);
+        const obj: HeapObject = { id, className: `${elementType}[]`, fields: [], isArray: true, arrayElementType: elementType, elements };
+        this.heap.set(id, obj);
+        const ref: Reference = { kind: 'ref', heapId: id };
+        this.addStep(0, `Create ${elementType}[${elements.length}] array (${id})`, { newHeapIds: [id] });
+        return ref;
       }
 
       case 'MethodCallExpr': {
@@ -290,6 +358,16 @@ export class Interpreter {
   }
 
   private evalNew(className: string, argExprs: Expr[], line: number): Reference {
+    // ArrayList built-in
+    if (className === 'ArrayList') {
+      const id = this.newObjectId();
+      const obj: HeapObject = { id, className: 'ArrayList', fields: [], isArray: true, arrayElementType: 'Object', elements: [] };
+      this.heap.set(id, obj);
+      const ref: Reference = { kind: 'ref', heapId: id };
+      this.addStep(line, `Create ArrayList (${id})`, { newHeapIds: [id] });
+      return ref;
+    }
+
     const classDef = this.classes.get(className);
     if (!classDef) throw new Error(`Line ${line}: class '${className}' not found`);
 
@@ -338,28 +416,93 @@ export class Interpreter {
   }
 
   private evalMethodCall(objVal: EvalValue | null, method: string, argExprs: Expr[], line: number): EvalValue {
-    // System.out.println special case
-    if (method === 'println') {
+    // System.out.println / print
+    if (method === 'println' || method === 'print') {
       const args = argExprs.map(a => this.evalExpr(a));
-      const text = args.map(a => {
-        if (typeof a === 'string') return a;
-        if (typeof a === 'number' || typeof a === 'boolean') return String(a);
-        if (isRef(a)) {
-          if (a.heapId === null) return 'null';
-          const obj = this.heap.get(a.heapId);
-          if (obj?.isString) return obj.stringValue ?? '';
-          return obj ? `${obj.className}@${obj.id}` : 'null';
-        }
-        return String(a);
-      }).join('');
-      this.output.push(text);
-      this.addStep(line, `System.out.println("${text}")`);
+      const text = args.map(a => this.toJavaString(a)).join('');
+      if (method === 'print') {
+        this.pendingLine += text;
+        this.addStep(line, `System.out.print("${text}")`);
+      } else {
+        const fullLine = this.pendingLine + text;
+        this.pendingLine = '';
+        this.output.push(fullLine);
+        this.addStep(line, `System.out.println("${fullLine}")`);
+      }
       return NULL_REF;
     }
 
-    // print (without newline) - same handling
-    if (method === 'print') {
-      return this.evalMethodCall(objVal, 'println', argExprs, line);
+    // ArrayList / array built-in methods
+    if (isRef(objVal) && objVal.heapId) {
+      const listObj = this.heap.get(objVal.heapId);
+      if (listObj?.isArray && listObj.elements !== undefined) {
+        const elems = listObj.elements;
+        switch (method) {
+          case 'add': {
+            const args = this.evalArgs(argExprs);
+            if (args.length === 2) {
+              // add(index, element) — insert at position
+              const idx = args[0] as number;
+              elems.splice(idx, 0, args[1]);
+              this.addStep(line, `${listObj.className}.add(${idx}, ${this.evalValueToDisplay(args[1])})`, { changedHeapId: listObj.id });
+            } else {
+              elems.push(args[0]);
+              this.addStep(line, `${listObj.className}.add(${this.evalValueToDisplay(args[0])})`, { changedHeapId: listObj.id });
+            }
+            return { kind: 'ref', heapId: null } as Reference;
+          }
+          case 'get': {
+            const args = argExprs.map(a => this.evalExpr(a));
+            const idx = args[0] as number;
+            if (idx < 0 || idx >= elems.length) throw new Error(`Line ${line}: index ${idx} out of bounds (size ${elems.length})`);
+            this.addStep(line, `${listObj.className}.get(${idx})`, { changedHeapId: listObj.id, changedField: String(idx) });
+            return this.toEvalValue(elems[idx]) as Reference;
+          }
+          case 'set': {
+            const args = this.evalArgs(argExprs);
+            const idx = args[0] as number;
+            const old = elems[idx];
+            elems[idx] = args[1];
+            this.addStep(line, `${listObj.className}.set(${idx}, ${this.evalValueToDisplay(args[1])})`, { changedHeapId: listObj.id, changedField: String(idx) });
+            return this.toEvalValue(old) as Reference;
+          }
+          case 'remove': {
+            const args = argExprs.map(a => this.evalExpr(a));
+            const idx = args[0] as number;
+            const removed = elems.splice(idx, 1)[0];
+            this.addStep(line, `${listObj.className}.remove(${idx})`, { changedHeapId: listObj.id });
+            return this.toEvalValue(removed) as Reference;
+          }
+          case 'size': {
+            this.addStep(line, `${listObj.className}.size() = ${elems.length}`);
+            return elems.length;
+          }
+          case 'length': {
+            return elems.length;
+          }
+          case 'isEmpty': {
+            const empty = elems.length === 0;
+            this.addStep(line, `${listObj.className}.isEmpty() = ${empty}`);
+            return empty;
+          }
+          case 'clear': {
+            elems.length = 0;
+            this.addStep(line, `${listObj.className}.clear()`, { changedHeapId: listObj.id });
+            return NULL_REF;
+          }
+          case 'contains': {
+            const args = argExprs.map(a => this.evalExpr(a));
+            const needle = this.toJavaString(args[0]);
+            const found = elems.some(e => this.toJavaString(this.toEvalValue(e)) === needle);
+            this.addStep(line, `${listObj.className}.contains() = ${found}`);
+            return found;
+          }
+          case 'toString': {
+            const parts = elems.map(e => this.toJavaString(this.toEvalValue(e)));
+            return `[${parts.join(', ')}]`;
+          }
+        }
+      }
     }
 
     // Static method call (no object qualifier) — search all registered classes
@@ -436,6 +579,53 @@ export class Interpreter {
     return returnValue;
   }
 
+  private evalNewArrayND(elementType: string, dims: number[], line: number): Reference {
+    // Create inner arrays without steps, then one outer step
+    const innerRefs: string[] = [];
+    const createInner = (depth: number): Reference => {
+      const id = this.newObjectId();
+      innerRefs.push(id);
+      const innerElementType = depth === 1 ? elementType : elementType + '[]'.repeat(dims.length - depth);
+      const elements: VarValue[] = depth === 1
+        ? new Array(dims[dims.length - 1]).fill(isPrimitive(elementType) ? 0 : NULL_REF)
+        : Array.from({ length: dims[dims.length - depth] }, () => createInner(depth - 1));
+      const className = elementType + '[]'.repeat(depth);
+      const obj: HeapObject = { id, className, fields: [], isArray: true, arrayElementType: innerElementType, elements };
+      this.heap.set(id, obj);
+      return { kind: 'ref', heapId: id };
+    };
+
+    const outerRef = createInner(dims.length);
+    const outerObj = this.heap.get(outerRef.heapId!)!;
+    this.addStep(line, `Create ${outerObj.className} (${dims.join('×')}) array (${outerRef.heapId})`, {
+      newHeapIds: innerRefs,
+    });
+    return outerRef;
+  }
+
+  private evalNewArray(elementType: string, size: number, line: number): Reference {
+    const id = this.newObjectId();
+    const defaultVal: VarValue = isPrimitive(elementType) ? 0 : NULL_REF;
+    const elements: VarValue[] = new Array(size).fill(defaultVal);
+    const obj: HeapObject = { id, className: `${elementType}[]`, fields: [], isArray: true, arrayElementType: elementType, elements };
+    this.heap.set(id, obj);
+    const ref: Reference = { kind: 'ref', heapId: id };
+    this.addStep(line, `Create ${elementType}[${size}] array (${id})`, { newHeapIds: [id] });
+    return ref;
+  }
+
+  private inferElementType(elements: VarValue[]): string {
+    if (elements.length === 0) return 'Object';
+    const first = elements[0];
+    if (isRef(first) && first.heapId) {
+      const obj = this.heap.get(first.heapId);
+      return obj?.isString ? 'String' : (obj?.className ?? 'Object');
+    }
+    if (typeof first === 'number') return Number.isInteger(first) ? 'int' : 'double';
+    if (typeof first === 'boolean') return 'boolean';
+    return 'Object';
+  }
+
   private evalMathMethod(method: string, argExprs: Expr[], line: number): number {
     const args = argExprs.map(a => this.evalExpr(a)) as number[];
     switch (method) {
@@ -504,9 +694,29 @@ export class Interpreter {
             }
           }
           this.addStep(stmt.line, `${name} = ${this.evalValueToDisplay(val)}`);
+        } else if (stmt.target.kind === 'ArrayAccessExpr') {
+          // arr[i] = val
+          const target = stmt.target as ArrayAccessExpr;
+          const arrRef = this.evalExpr(target.array);
+          if (!isRef(arrRef) || arrRef.heapId === null) throw new Error(`Line ${stmt.line}: array assignment on non-array`);
+          const arrObj = this.heap.get(arrRef.heapId);
+          if (!arrObj?.isArray || !arrObj.elements) throw new Error(`Line ${stmt.line}: not an array`);
+          const idx = this.evalExpr(target.index) as number;
+          const stored: VarValue = typeof val === 'string' ? this.boxString(val) : val as VarValue;
+          const newHeapIds: string[] = [];
+          if (isRef(stored) && stored.heapId) {
+            const ro = this.heap.get(stored.heapId);
+            if (ro?.isString) newHeapIds.push(stored.heapId);
+          }
+          arrObj.elements[idx] = stored;
+          this.addStep(stmt.line, `Set ${arrObj.className}[${idx}] = ${this.evalValueToDisplay(val)}`, {
+            changedHeapId: arrObj.id,
+            changedField: String(idx),
+            newHeapIds,
+          });
         } else {
           // FieldAccessExpr
-          const target = stmt.target;
+          const target = stmt.target as FieldAccessExpr;
           let objRef: EvalValue;
           if (target.object.kind === 'ThisExpr') {
             objRef = this.currentThis ?? NULL_REF;
@@ -583,6 +793,25 @@ export class Interpreter {
         }
         return undefined;
       }
+
+      case 'ForStmt': {
+        if (stmt.init) this.execStatement(stmt.init);
+        let iterations = 0;
+        while (iterations < 1000) {
+          if (stmt.condition) {
+            const cond = this.evalExpr(stmt.condition);
+            this.addStep(stmt.line, `for (${!!cond})`);
+            if (!cond) break;
+          }
+          for (const s of stmt.body) {
+            const r = this.execStatement(s);
+            if (r !== undefined) return r;
+          }
+          if (stmt.update) this.execStatement(stmt.update);
+          iterations++;
+        }
+        return undefined;
+      }
     }
   }
 
@@ -592,6 +821,7 @@ export class Interpreter {
     this.heap.clear();
     this.callStack = [];
     this.output = [];
+    this.pendingLine = '';
     this.steps = [];
     this.stringCounter = 0;
     this.objectCounter = 0;

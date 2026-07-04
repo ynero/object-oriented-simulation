@@ -25,6 +25,9 @@ export interface HeapObject {
   fields: Variable[];
   isString?: boolean;
   stringValue?: string;
+  isArray?: boolean;
+  arrayElementType?: string;
+  elements?: VarValue[];
 }
 
 export interface MemoryState {
@@ -95,7 +98,8 @@ export type Statement =
   | ExprStmt
   | ReturnStmt
   | IfStmt
-  | WhileStmt;
+  | WhileStmt
+  | ForStmt;
 
 export interface VarDeclStmt {
   kind: 'VarDeclStmt';
@@ -107,7 +111,7 @@ export interface VarDeclStmt {
 
 export interface AssignStmt {
   kind: 'AssignStmt';
-  target: IdentifierExpr | FieldAccessExpr;
+  target: IdentifierExpr | FieldAccessExpr | ArrayAccessExpr;
   value: Expr;
   line: number;
 }
@@ -139,14 +143,26 @@ export interface WhileStmt {
   line: number;
 }
 
+export interface ForStmt {
+  kind: 'ForStmt';
+  init?: Statement;
+  condition?: Expr;
+  update?: Statement;
+  body: Statement[];
+  line: number;
+}
+
 export type Expr =
   | LiteralExpr
   | IdentifierExpr
   | BinaryExpr
   | UnaryExpr
   | FieldAccessExpr
+  | ArrayAccessExpr
   | MethodCallExpr
   | NewObjectExpr
+  | NewArrayExpr
+  | ArrayInitExpr
   | ThisExpr
   | NullLiteral;
 
@@ -207,5 +223,25 @@ export interface ThisExpr {
 
 export interface NullLiteral {
   kind: 'NullLiteral';
+  line: number;
+}
+
+export interface ArrayAccessExpr {
+  kind: 'ArrayAccessExpr';
+  array: Expr;
+  index: Expr;
+  line: number;
+}
+
+export interface NewArrayExpr {
+  kind: 'NewArrayExpr';
+  elementType: string;
+  dimensions: Expr[];   // e.g. [3] for int[3], [3, 4] for int[3][4]
+  line: number;
+}
+
+export interface ArrayInitExpr {
+  kind: 'ArrayInitExpr';
+  elements: Expr[];
   line: number;
 }

@@ -201,6 +201,51 @@ function HeapCard({ obj, step, heap, refLabels, isHighlighted, hoveredId, onHove
   const isNew = step.newHeapIds.includes(obj.id);
   const isChanged = step.changedHeapId === obj.id;
 
+  // ── Array / ArrayList card ─────────────────────────────────────────────────
+  if (obj.isArray && obj.elements !== undefined) {
+    return (
+      <motion.div
+        id={`heap-${obj.id}`}
+        key={obj.id}
+        layout
+        initial={{ opacity: 0, scale: 0.85 }}
+        animate={{ opacity: 1, scale: 1 }}
+        className={`heap-card heap-array ${isNew ? 'heap-new' : ''} ${isChanged ? 'heap-changed' : ''} ${isHighlighted ? 'heap-highlighted' : ''}`}
+      >
+        <div className="heap-card-header">
+          <span className="heap-class-label">{obj.className}</span>
+          {refLabels.length > 0 && (
+            <span className="heap-ref-badges">
+              {refLabels.map(lbl => <span key={lbl} className="ref-badge">{lbl}</span>)}
+            </span>
+          )}
+        </div>
+        <div className="heap-id">{obj.id} · length={obj.elements.length}</div>
+        <div className="heap-fields">
+          {obj.elements.length === 0 && <div className="empty-hint">(empty)</div>}
+          {obj.elements.map((elem, i) => {
+            const { text, isRef: isRefVal, refId } = displayValue(elem, heap);
+            const elemChanged = isChanged && step.changedField === String(i);
+            const isHov = refId !== null && hoveredId === refId;
+            return (
+              <div
+                key={i}
+                id={`heap-elem-${obj.id}-${i}`}
+                className={`heap-field ${elemChanged ? 'field-changed' : ''} ${isHov ? 'field-hovered' : ''}`}
+                onMouseEnter={() => refId && onHover(refId)}
+                onMouseLeave={() => onHover(null)}
+              >
+                <span className="field-type array-index">[{i}]</span>
+                <span className="field-equals">=</span>
+                <span className={`field-value ${isRefVal ? 'ref-value' : 'prim-value'}`}>{text}</span>
+              </div>
+            );
+          })}
+        </div>
+      </motion.div>
+    );
+  }
+
   if (obj.isString) {
     return (
       <motion.div
@@ -369,6 +414,23 @@ export function MemoryView({ step }: Props) {
         }
       }
     });
+  });
+  // Arrows from array/ArrayList elements that are references
+  heap.forEach(obj => {
+    if (obj.isArray && obj.elements) {
+      obj.elements.forEach((elem, i) => {
+        if (isRef(elem) && elem.heapId !== null) {
+          const target = heap.find(o => o.id === elem.heapId);
+          if (target) {
+            arrows.push({
+              fromId: `heap-elem-${obj.id}-${i}`,
+              toId: `heap-${elem.heapId}`,
+              color: target.isString ? '#60a5fa' : '#f59e0b',
+            });
+          }
+        }
+      });
+    }
   });
 
   return (

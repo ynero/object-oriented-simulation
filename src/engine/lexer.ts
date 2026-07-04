@@ -1,7 +1,8 @@
 export type TokenKind =
   | 'keyword' | 'identifier' | 'integer' | 'double' | 'string' | 'boolean' | 'null'
-  | 'lparen' | 'rparen' | 'lbrace' | 'rbrace' | 'semicolon' | 'comma' | 'dot'
-  | 'assign' | 'plusassign' | 'minusassign'
+  | 'lparen' | 'rparen' | 'lbrace' | 'rbrace' | 'lbracket' | 'rbracket'
+  | 'semicolon' | 'comma' | 'dot'
+  | 'assign' | 'plusassign' | 'minusassign' | 'plusplus' | 'minusminus'
   | 'plus' | 'minus' | 'star' | 'slash' | 'percent'
   | 'eq' | 'neq' | 'lt' | 'gt' | 'lte' | 'gte'
   | 'and' | 'or' | 'not'
@@ -99,12 +100,15 @@ export function tokenize(source: string): Token[] {
     if (two === '>=') { tokens.push({ kind: 'gte', value: '>=', line }); i += 2; continue; }
     if (two === '&&') { tokens.push({ kind: 'and', value: '&&', line }); i += 2; continue; }
     if (two === '||') { tokens.push({ kind: 'or', value: '||', line }); i += 2; continue; }
+    if (two === '++') { tokens.push({ kind: 'plusplus', value: '++', line }); i += 2; continue; }
+    if (two === '--') { tokens.push({ kind: 'minusminus', value: '--', line }); i += 2; continue; }
     if (two === '+=') { tokens.push({ kind: 'plusassign', value: '+=', line }); i += 2; continue; }
     if (two === '-=') { tokens.push({ kind: 'minusassign', value: '-=', line }); i += 2; continue; }
 
     // Single-char
     const single: Record<string, TokenKind> = {
       '(': 'lparen', ')': 'rparen', '{': 'lbrace', '}': 'rbrace',
+      '[': 'lbracket', ']': 'rbracket',
       ';': 'semicolon', ',': 'comma', '.': 'dot',
       '=': 'assign', '+': 'plus', '-': 'minus', '*': 'star',
       '/': 'slash', '%': 'percent', '<': 'lt', '>': 'gt', '!': 'not',

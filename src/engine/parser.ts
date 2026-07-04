@@ -1,9 +1,9 @@
 import { tokenize, Token, TokenKind } from './lexer';
 import type {
   Program, ClassDecl, FieldDecl, ConstructorDecl, MethodDecl, Param,
-  Statement, VarDeclStmt, AssignStmt, ExprStmt, ReturnStmt, IfStmt, WhileStmt,
+  Statement, VarDeclStmt, AssignStmt, ExprStmt, ReturnStmt, IfStmt, WhileStmt, ForStmt,
   Expr, LiteralExpr, IdentifierExpr, BinaryExpr, UnaryExpr,
-  FieldAccessExpr, MethodCallExpr, NewObjectExpr, ThisExpr, NullLiteral,
+  FieldAccessExpr, ArrayAccessExpr, MethodCallExpr, NewObjectExpr, NewArrayExpr, ArrayInitExpr, ThisExpr, NullLiteral,
 } from './types';
 
 const PRIMITIVE_TYPES = new Set(['int', 'double', 'float', 'boolean', 'char', 'byte', 'short', 'long', 'String', 'void']);
@@ -49,11 +49,24 @@ class Parser {
   private parseType(): string {
     const t = this.advance();
     let type = t.value;
-    // Handle array types like int[]
-    if (this.check('lbrace') || (this.peek().value === '[')) {
-      // skip array notation
+    // Handle generic type params: ArrayList<String> → skip <...>
+    if (this.check('lt')) this.skipGenericTypeParams();
+    // Handle array type suffix: int[] → 'int[]'
+    while (this.check('lbracket')) {
+      this.advance();
+      if (this.check('rbracket')) this.advance();
+      type += '[]';
     }
     return type;
+  }
+
+  private skipGenericTypeParams(): void {
+    let depth = 0;
+    while (!this.check('eof')) {
+      if (this.check('lt')) { depth++; this.advance(); }
+      else if (this.check('gt')) { depth--; this.advance(); if (depth <= 0) break; }
+      else this.advance();
+    }
   }
 
   // ── Top level ─────────────────────────────────────────────────────────────
@@ -187,8 +200,17 @@ class Parser {
       return this.parseWhile();
     }
 
-    // Variable declaration: primitive-type identifier
+    // For
+    if (t0.kind === 'keyword' && t0.value === 'for') {
+      return this.parseFor();
+    }
+
+    // Variable declaration: primitive-type identifier (handles int[] arr too)
     if (t0.kind === 'keyword' && PRIMITIVE_TYPES.has(t0.value) && t1.kind === 'identifier') {
+      return this.parseVarDecl();
+    }
+    // int[] arr — after [] the next token is identifier
+    if (t0.kind === 'keyword' && PRIMITIVE_TYPES.has(t0.value) && t1.kind === 'lbracket') {
       return this.parseVarDecl();
     }
 
@@ -198,6 +220,20 @@ class Parser {
       (t1.kind === 'identifier') &&
       (t2.kind === 'assign' || t2.kind === 'semicolon')
     ) {
+      return this.parseVarDecl();
+    }
+    // ClassName[] identifier = ...  — EMPTY brackets (type suffix) followed by identifier name
+    // Distinct from matrix[row] where the bracket contains an expression
+    if (
+      t0.kind === 'identifier' &&
+      t1.kind === 'lbracket' &&
+      this.peek(2).kind === 'rbracket' &&
+      this.peek(3).kind === 'identifier'
+    ) {
+      return this.parseVarDecl();
+    }
+    // ClassName<Generic> identifier = ...  (e.g. ArrayList<String> list)
+    if (t0.kind === 'identifier' && t1.kind === 'lt') {
       return this.parseVarDecl();
     }
 
@@ -230,10 +266,10 @@ class Parser {
       this.advance();
       const value = this.parseExpr();
       this.match('semicolon');
-      if (expr.kind !== 'IdentifierExpr' && expr.kind !== 'FieldAccessExpr') {
+      if (expr.kind !== 'IdentifierExpr' && expr.kind !== 'FieldAccessExpr' && expr.kind !== 'ArrayAccessExpr') {
         throw new Error(`Line ${ln}: invalid assignment target`);
       }
-      return { kind: 'AssignStmt', target: expr as IdentifierExpr | FieldAccessExpr, value, line: ln };
+      return { kind: 'AssignStmt', target: expr as IdentifierExpr | FieldAccessExpr | ArrayAccessExpr, value, line: ln };
     }
 
     this.match('semicolon');
@@ -263,6 +299,52 @@ class Parser {
     this.eat('rparen');
     const body = this.parseBlock();
     return { kind: 'WhileStmt', condition, body, line: ln };
+  }
+
+  private parseFor(): ForStmt {
+    const ln = this.line();
+    this.eat('keyword', 'for');
+    this.eat('lparen');
+
+    // Init — parse without consuming the ';' as a statement terminator
+    let init: Statement | undefined;
+    if (!this.check('semicolon')) {
+      const t0 = this.peek(0);
+      const t1 = this.peek(1);
+      if ((t0.kind === 'keyword' && PRIMITIVE_TYPES.has(t0.value)) || t0.kind === 'identifier') {
+        // Likely a var decl: int i = 0
+        const type = this.parseType();
+        const name = this.eat('identifier').value;
+        let initExpr: Expr = { kind: 'NullLiteral', line: ln };
+        if (this.check('assign')) { this.advance(); initExpr = this.parseExpr(); }
+        init = { kind: 'VarDeclStmt', type, name, init: initExpr, line: ln };
+      } else {
+        init = { kind: 'ExprStmt', expr: this.parseExpr(), line: ln };
+      }
+    }
+    this.eat('semicolon');
+
+    // Condition
+    let condition: Expr | undefined;
+    if (!this.check('semicolon')) condition = this.parseExpr();
+    this.eat('semicolon');
+
+    // Update — no trailing semicolon, ends at ')'
+    let update: Statement | undefined;
+    if (!this.check('rparen')) {
+      const updExpr = this.parseExpr();
+      if (this.check('assign')) {
+        this.advance();
+        const val = this.parseExpr();
+        update = { kind: 'AssignStmt', target: updExpr as IdentifierExpr | FieldAccessExpr | ArrayAccessExpr, value: val, line: ln };
+      } else {
+        update = { kind: 'ExprStmt', expr: updExpr, line: ln };
+      }
+    }
+    this.eat('rparen');
+
+    const body = this.parseBlock();
+    return { kind: 'ForStmt', init, condition, update, body, line: ln };
   }
 
   private parseBlock(): Statement[] {
@@ -343,23 +425,37 @@ class Parser {
 
   private parsePostfix(): Expr {
     let expr = this.parsePrimary();
-    // Handle chained .field and .method() accesses
-    while (this.check('dot')) {
+    while (true) {
       const ln = this.line();
-      this.advance(); // consume '.'
-      const name = this.advance().value; // field or method name
-      if (this.check('lparen')) {
-        // Method call
-        this.eat('lparen');
-        const args: Expr[] = [];
-        while (!this.check('rparen') && !this.check('eof')) {
-          args.push(this.parseExpr());
-          this.match('comma');
+      if (this.check('lbracket')) {
+        // Array element access: arr[i]
+        this.advance();
+        const index = this.parseExpr();
+        this.eat('rbracket');
+        expr = { kind: 'ArrayAccessExpr', array: expr, index, line: ln };
+      } else if (this.check('dot')) {
+        this.advance();
+        const name = this.advance().value;
+        if (this.check('lparen')) {
+          this.eat('lparen');
+          const args: Expr[] = [];
+          while (!this.check('rparen') && !this.check('eof')) {
+            args.push(this.parseExpr());
+            this.match('comma');
+          }
+          this.eat('rparen');
+          expr = { kind: 'MethodCallExpr', object: expr, method: name, args, line: ln };
+        } else {
+          expr = { kind: 'FieldAccessExpr', object: expr, field: name, line: ln };
         }
-        this.eat('rparen');
-        expr = { kind: 'MethodCallExpr', object: expr, method: name, args, line: ln };
+      } else if (this.check('plusplus')) {
+        this.advance();
+        expr = { kind: 'UnaryExpr', op: '++', operand: expr, line: ln };
+      } else if (this.check('minusminus')) {
+        this.advance();
+        expr = { kind: 'UnaryExpr', op: '--', operand: expr, line: ln };
       } else {
-        expr = { kind: 'FieldAccessExpr', object: expr, field: name, line: ln };
+        break;
       }
     }
     return expr;
@@ -405,10 +501,41 @@ class Parser {
       return { kind: 'ThisExpr', line: ln };
     }
 
-    // new ClassName(args)
+    // Array literal: {1, 2, 3}
+    if (t.kind === 'lbrace') {
+      this.advance();
+      const elements: Expr[] = [];
+      while (!this.check('rbrace') && !this.check('eof')) {
+        elements.push(this.parseExpr());
+        this.match('comma');
+      }
+      this.eat('rbrace');
+      return { kind: 'ArrayInitExpr', elements, line: ln };
+    }
+
+    // new int[n] / new ClassName(args) / new ArrayList<>()
     if (t.kind === 'keyword' && t.value === 'new') {
       this.advance();
-      const className = this.advance().value;
+      const typeName = this.advance().value;
+      // Skip generic type params: new ArrayList<String>() or new ArrayList<>()
+      if (this.check('lt')) this.skipGenericTypeParams();
+      if (this.check('lbracket')) {
+        // Array creation: new int[n], new int[n][m], etc.
+        const dimensions: Expr[] = [];
+        while (this.check('lbracket') && this.peek(1).kind !== 'rbracket') {
+          this.advance(); // consume [
+          dimensions.push(this.parseExpr());
+          this.eat('rbracket');
+        }
+        // Skip trailing empty [] type suffixes (e.g. new int[3][])
+        while (this.check('lbracket') && this.peek(1).kind === 'rbracket') {
+          this.advance(); this.advance();
+        }
+        // Optional empty initializer braces
+        if (this.check('lbrace')) { this.advance(); this.eat('rbrace'); }
+        return { kind: 'NewArrayExpr', elementType: typeName, dimensions, line: ln };
+      }
+      // Object creation
       this.eat('lparen');
       const args: Expr[] = [];
       while (!this.check('rparen') && !this.check('eof')) {
@@ -416,7 +543,7 @@ class Parser {
         this.match('comma');
       }
       this.eat('rparen');
-      return { kind: 'NewObjectExpr', className, args, line: ln };
+      return { kind: 'NewObjectExpr', className: typeName, args, line: ln };
     }
 
     // Grouped expression

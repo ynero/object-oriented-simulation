@@ -242,6 +242,7 @@ body { background: var(--bg); color: var(--text); overflow: hidden; }
 
 .heap-object { border-color: #7c3aed; }
 .heap-string { border-color: #2563eb; }
+.heap-array  { border-color: #0d9488; }
 
 .heap-new {
   border-color: var(--green) !important;
@@ -273,6 +274,9 @@ body { background: var(--bg); color: var(--text); overflow: hidden; }
 }
 .heap-object .heap-class-label { color: #a78bfa; }
 .heap-string .heap-class-label { color: var(--blue); }
+.heap-array  .heap-class-label { color: #2dd4bf; }
+
+.array-index { color: #2dd4bf; font-size: 11px; min-width: 28px; font-weight: 700; }
 
 .heap-ref-badges {
   display: flex;
