@@ -25,6 +25,13 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, { error: Er
   }
 }
 
+window.addEventListener('error', (e) => {
+  const root = document.getElementById('root');
+  if (root) {
+    root.innerHTML = `<div style="padding:32px;background:#0f1117;color:#f87171;font-family:monospace;white-space:pre-wrap"><div style="font-size:18px;margin-bottom:16px">⚠ JS Error (uncaught)</div><div>${e.message}</div><div style="margin-top:12px;font-size:11px;color:#94a3b8">${e.filename}:${e.lineno}</div></div>`;
+  }
+});
+
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ErrorBoundary>
